@@ -13,7 +13,8 @@ scaler = None
 # === Configuration ===
 # Top 10 features selected based on EDA correlation analysis
 SELECTED_FEATURES = ['M4', 'V13', 'S5', 'S2', 'V7', 'M2', 'M17', 'M12', 'M8', 'S6']
-TRAIN_DATA_PATH = r'C:\Users\36007\Desktop\CUHKSZ\2025-Fall\DDA3020\Homework\Project\Basic Resource\train.csv'
+current_dir = os.path.dirname(os.path.abspath(__file__))
+TRAIN_DATA_PATH = os.path.normpath(os.path.join(current_dir, '..', 'data', 'train.csv'))
 
 def train_model():
     """
@@ -133,13 +134,15 @@ def predict(test: pl.DataFrame) -> float:
 # === Entry Point for Kaggle Evaluation API ===
 if __name__ == "__main__":
     inference_server = kaggle_evaluation.default_inference_server.DefaultInferenceServer(predict)
+    data_dir = os.path.normpath(os.path.join(current_dir, '..', 'data'))
 
     if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         inference_server.serve()
     else:
-        local_data_dir = r'C:\Users\36007\Desktop\CUHKSZ\2025-Fall\DDA3020\Homework\Project\Basic Resource'
+        inference_server.run_local_gateway((data_dir,))
         
         print(f"Start local evaluation, data directory: {local_data_dir}")
         inference_server.run_local_gateway(
             (local_data_dir,)  
+
         )
