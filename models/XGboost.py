@@ -1,10 +1,10 @@
 import pandas as pd
 import numpy as np
-import os
 import xgboost as xgb
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error
 import warnings
+import os
 
 warnings.filterwarnings('ignore')
 
@@ -14,29 +14,11 @@ class FastXGBPredictor:
         self.feature_groups = {}
         self.best_params = None
         
-    def load_data(self, file_path):
-        """Load data from csv file"""
-        print(f"Loading data from {file_path}...")
-        if not os.path.exists(file_path):
-            print(f"Error: File not found at {file_path}")
-            return None
-            
-        df = pd.read_csv(file_path)
-        print(f"Data shape: {df.shape}")
-        return df
-    
-    def create_feature_groups_by_importance(self, train_df, target_col='forward_returns', top_pct=0.1, mid_pct=0.5):
+    def create_feature_groups_by_importance(self, X, y, top_pct=0.1, mid_pct=0.5):
         """Create three feature groups based on feature importance from an initial XGB run"""
         print("Creating feature groups by importance...")
         
-        # Prepare features and target
-        # Exclude non-feature columns
-        feature_cols = [col for col in train_df.columns if col not in 
-                       ['date_id', 'forward_returns', 'risk_free_rate', 
-                        'market_forward_excess_returns', 'is_scored']]
-        
-        X = train_df[feature_cols].fillna(0)
-        y = train_df[target_col]
+        feature_cols = X.columns.tolist()
         
         # Train initial model to get feature importance
         initial_model = xgb.XGBRegressor(
@@ -79,13 +61,14 @@ class FastXGBPredictor:
         """Tune regularization parameters for a specific feature group"""
         print(f"\nTuning {feature_group_name} with {len(features)} features...")
         
-        X_subset = X_train[features].fillna(0)
+        X_subset = X_train[features]
         
-        # Define parameter grid
+        # Define parameter grid (Simplified for speed in run mode)
         param_combinations = []
-        for reg_alpha in [0, 0.1, 0.5, 1, 2]:  # L1 regularization
-            for reg_lambda in [0.1, 0.5, 1, 2, 5]:  # L2 regularization
-                for max_depth in [3, 4, 5]:
+        # Reduced grid for faster execution
+        for reg_alpha in [0, 1]:  
+            for reg_lambda in [1, 5]: 
+                for max_depth in [3, 4]:
                     param_combinations.append({
                         'reg_alpha': reg_alpha,
                         'reg_lambda': reg_lambda,
@@ -97,12 +80,10 @@ class FastXGBPredictor:
         best_score = float('inf')
         best_params = None
         
-        # Test first 10 combinations for speed (in this demo)
-        # In production, you might want to test more
-        for i, params in enumerate(param_combinations[:10]):
+        for i, params in enumerate(param_combinations):
             try:
                 model = xgb.XGBRegressor(
-                    n_estimators=100,
+                    n_estimators=50, # Reduced for tuning speed
                     learning_rate=0.1,
                     reg_alpha=params['reg_alpha'],
                     reg_lambda=params['reg_lambda'],
@@ -134,12 +115,9 @@ class FastXGBPredictor:
         
         return best_params
     
-    def find_best_regularization_combinations(self, train_df, target_col='forward_returns'):
+    def find_best_regularization_combinations(self, X_train, y_train):
         """Find the best parameters for the 3 feature groups"""
         print("Finding best regularization combinations...")
-        
-        X_train = train_df
-        y_train = train_df[target_col]
         
         # Tune parameters for each group
         group_results = {}
@@ -147,8 +125,7 @@ class FastXGBPredictor:
             best_params = self.tune_regularization_params(X_train, y_train, group_name, features)
             if best_params:
                 group_results[group_name] = best_params
-                print(f"{group_name}: {best_params}")
-        
+                
         # Select best combinations
         all_combinations = []
         for group_name, params in group_results.items():
@@ -160,16 +137,13 @@ class FastXGBPredictor:
         all_combinations.sort(key=lambda x: x['score'])
         best_combinations = all_combinations[:3]
         
-        print(f"\nBest 3 regularization combinations:")
-        for i, combo in enumerate(best_combinations, 1):
-            print(f"{i}. {combo}")
-        
+        print(f"\nBest regularization combination found: {best_combinations[0]}")
         self.best_params = best_combinations
         return best_combinations
     
-    def train_final_model(self, train_df, test_df, target_col='forward_returns'):
+    def train_final_model(self, X_train, y_train, X_test):
         """Train final model using the best found parameters"""
-        print("\nTraining final model with best parameters...")
+        print("\nTraining final XGBoost model...")
         
         # Use the best group configuration
         best_group = self.best_params[0]['feature_group']
@@ -177,20 +151,17 @@ class FastXGBPredictor:
         params = self.best_params[0]
         
         print(f"Using feature group: {best_group} with {len(features)} features")
-        print(f"Parameters: {params}")
         
-        X_train = train_df[features].fillna(0)
-        y_train = train_df[target_col]
-        
-        # Ensure test_df has the same features
-        # If features are missing in test_df, fill with 0
-        X_test = pd.DataFrame(index=test_df.index)
+        # Align test features (fill missing with 0)
+        X_test_selected = pd.DataFrame(index=X_test.index)
         for f in features:
-            if f in test_df.columns:
-                X_test[f] = test_df[f]
+            if f in X_test.columns:
+                X_test_selected[f] = X_test[f]
             else:
-                X_test[f] = 0.0
-        X_test = X_test.fillna(0)
+                X_test_selected[f] = 0.0
+                
+        X_train_final = X_train[features]
+        X_test_final = X_test_selected
         
         # Train final XGB
         self.model = xgb.XGBRegressor(
@@ -203,105 +174,69 @@ class FastXGBPredictor:
             n_jobs=-1
         )
         
-        self.model.fit(X_train, y_train)
+        self.model.fit(X_train_final, y_train)
         
         # Predict
-        train_pred = self.model.predict(X_train)
-        test_pred = self.model.predict(X_test)
-        
-        # Calculate RMSE
-        train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
-        print(f"Training RMSE: {train_rmse:.6f}")
-        
+        test_pred = self.model.predict(X_test_final)
         return test_pred
-    
-    def calculate_positions(self, predictions, method='adaptive_sigmoid'):
-        """Convert predictions to portfolio weights (0 to 2)"""
-        if method == 'adaptive_sigmoid':
-            # Adaptive sigmoid based on prediction distribution
-            pred_mean = np.mean(predictions)
-            pred_std = np.std(predictions)
-            
-            # Adjust scale factor
-            if pred_std > 0:
-                scale_factor = 1 / (pred_std * 2)
-            else:
-                scale_factor = 10
-                
-            # Sigmoid mapping
-            positions = 1 + (1 / (1 + np.exp(-(predictions - pred_mean) * scale_factor)) - 0.5) * 2
-        
-        elif method == 'volatility_adjusted':
-            pred_vol = np.std(predictions)
-            if pred_vol > 0:
-                z_scores = (predictions - np.mean(predictions)) / pred_vol
-                positions = np.clip(1 + z_scores * 0.5, 0, 2)
-            else:
-                positions = np.ones_like(predictions)
-        
-        else:
-            # Simple clipping
-            positions = np.clip(predictions * 5 + 1, 0, 2)
-        
-        # Final Clip to [0, 2]
-        positions = np.clip(positions, 0, 2)
-        
-        print(f"Position stats - Min: {positions.min():.3f}, Max: {positions.max():.3f}, Mean: {positions.mean():.3f}")
-        return positions
 
-def main():
-    """Main execution flow"""
+def run(X_train, y_train, X_test):
+    """
+    Standardized interface function for XGBoost model.
     
-    # 1. Setup Paths
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    # Assuming directory structure: project/models/this_script.py and project/data/train.csv
-    data_dir = os.path.join(current_dir, 'Basic Resource')
+    Args:
+        X_train (pd.DataFrame): Training features
+        y_train (pd.Series): Training targets
+        X_test (pd.DataFrame): Test features
+        
+    Returns:
+        np.array: Predictions on X_test
+    """
+    print("="*50)
+    print(">>> XGBoost (Advanced Tuning): Training & Prediction...")
+    print("="*50)
     
-    # Paths to csv files
-    train_path = os.path.join(data_dir, 'train.csv')
-    test_path = os.path.join(data_dir, 'test.csv')
+    # Handle missing values for trees (though XGB handles NaN, 0 is safer here)
+    X_train = X_train.fillna(0)
+    X_test = X_test.fillna(0)
 
     predictor = FastXGBPredictor()
     
-    # 2. Load Data
-    train_df = predictor.load_data(train_path)
-    test_df = predictor.load_data(test_path)
+    # 1. Feature Selection & Grouping
+    predictor.create_feature_groups_by_importance(X_train, y_train)
     
-    if train_df is None or test_df is None:
-        print("Aborting due to missing data.")
-        return
+    # 2. Hyperparameter Tuning
+    # Note: This might take time. In 'run' mode we use a reduced grid in the class above.
+    predictor.find_best_regularization_combinations(X_train, y_train)
+    
+    # 3. Train & Predict
+    test_predictions = predictor.train_final_model(X_train, y_train, X_test)
+    
+    return test_predictions
 
-    # 3. Feature Selection & Grouping
-    feature_groups = predictor.create_feature_groups_by_importance(train_df)
-    
-    # 4. Hyperparameter Tuning
-    best_combinations = predictor.find_best_regularization_combinations(train_df)
-    
-    # 5. Train & Predict
-    test_predictions = predictor.train_final_model(train_df, test_df)
-    
-    # 6. Convert to Weights
-    positions = predictor.calculate_positions(test_predictions, method='adaptive_sigmoid')
-    
-    # 7. Create Submission File
-    # Ensure date_id exists in test_df, otherwise generate dummy index
-    if 'date_id' in test_df.columns:
-        date_ids = test_df['date_id']
-    else:
-        date_ids = range(len(positions))
-
-    submission = pd.DataFrame({
-        'date_id': date_ids,
-        'weight': positions
-    })
-    
-    output_file = 'submission_xgboost.csv'
-    submission.to_csv(output_file, index=False)
-    print(f"\nSubmission saved to {output_file} with {len(submission)} predictions")
-    
-    # Stats
-    print("\nPosition distribution:")
-    print(submission['weight'].describe())
-
+# Optional: Standalone test block
 if __name__ == "__main__":
-    main()
+    import os
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(current_dir, 'Basic Resource', 'train.csv')
+    
+    if os.path.exists(file_path):
+        print("Testing XGBoost module...")
+        df = pd.read_csv(file_path)
+        if 'date_id' in df.columns: df = df.sort_values('date_id').drop(columns=['date_id'])
+        
+        target = 'forward_returns'
+        drop_cols = ['market_forward_excess_returns', 'forward_returns', 'risk_free_rate', 'is_scored']
+        
+        split = int(len(df) * 0.8)
+        train = df.iloc[:split]
+        test = df.iloc[split:]
+        
+        X_train = train.drop(columns=[c for c in drop_cols if c in train.columns], errors='ignore')
+        y_train = train[target]
+        X_test = test.drop(columns=[c for c in drop_cols if c in test.columns], errors='ignore')
+        
+        preds = run(X_train, y_train, X_test)
+        print(f"Test Predictions: {preds[:5]}")
+    else:
+        print("Test data not found.")
