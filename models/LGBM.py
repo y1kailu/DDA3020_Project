@@ -20,7 +20,8 @@ LEARNING_RATE = 0.05     # Learning rate
 
 # 3. File Configuration
 # Changed to relative path. Make sure train.csv is in the same folder.
-FILE_PATH = r'C:\Users\36007\Desktop\CUHKSZ\2025-Fall\DDA3020\Homework\Project\Basic Resource\train.csv'
+current_dir = os.path.dirname(os.path.abspath(__file__))
+FILE_PATH = os.path.normpath(os.path.join(current_dir, '..', 'data', 'train.csv'))
 EPOCHS = 100             # Number of boosting rounds
 
 # =================================================
@@ -219,4 +220,5 @@ def run_lgbm():
     plt.show()
 
 if __name__ == "__main__":
+
     run_lgbm()
