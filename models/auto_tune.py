@@ -1,17 +1,25 @@
 import optuna
-import os
 import numpy as np
+import pandas as pd
+import os
+import sys
+import traceback # 移到最上面，方便全局调用
 from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
 
-# 导入数据处理
-from data.data_process import load_and_process_data
+# --- 导入模型 ---
+# 确保你的 models 文件夹下有这些文件，且 Ridge_Regression.py 没有空格
+try:
+    from models import LGBM, XGboost, Ridge_Regression, MLP, LSTM
+    from data.data_process import load_and_process_data
+except ImportError as e:
+    print(f"❌ 导入错误: {e}")
+    print("请确保：\n1. data_process.py 在 data/ 目录下\n2. 所有模型文件在 models/ 目录下\n3. Ridge Regression.py 已重命名为 Ridge_Regression.py")
+    sys.exit(1)
 
-# 导入你的模型模块 (确保它们都在 models/ 文件夹下且有 run 函数)
-from models import lgbm_model, xgboost_model, ridge_model, mlp_model, lstm_model
-
-# 全局配置
-N_TRIALS_TREE = 50   # 树模型尝试次数 (跑得快，可以多试)
-N_TRIALS_NN = 15     # 神经网络尝试次数 (跑得慢，少试几次)
+# --- 全局配置 ---
+N_TRIALS_TREE = 30   # 树模型尝试 30 次
+N_TRIALS_NN = 10     # 神经网络尝试 10 次 (LSTM/MLP 较慢)
 DATA_PATH = 'data/train.csv'
 
 def save_config(model_name, best_params):
@@ -30,17 +38,18 @@ def save_config(model_name, best_params):
         f.write("}\n")
     print(f"✅ Saved optimized config to {file_path}")
 
-def objective(trial, model_name, X_train, y_train, X_test, y_test):
-    """定义不同模型的搜索空间"""
-    
+def objective(trial, model_name, X, y, model_module):
+    """
+    使用 TimeSeriesSplit 进行交叉验证调参
+    """
     params = {}
     
-    # === 1. LightGBM Search Space ===
+    # === 1. 定义搜索空间 ===
     if model_name == 'LGBM':
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 500, 3000),
-            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 8, 64),
+            'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 20, 100),
             'max_depth': trial.suggest_int('max_depth', 3, 10),
             'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 10.0, log=True),
             'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
@@ -48,105 +57,99 @@ def objective(trial, model_name, X_train, y_train, X_test, y_test):
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'objective': 'regression',
             'metric': 'mse',
-            'random_state': 42,
             'n_jobs': -1,
             'verbose': -1
         }
-        # 调用模型训练 (注意：你的 run 函数需要能接收 params)
-        y_pred = lgbm_model.run(X_train, y_train, X_test, params)
-
-    # === 2. XGBoost Search Space ===
     elif model_name == 'XGBoost':
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 500, 3000),
-            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
+            'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
             'max_depth': trial.suggest_int('max_depth', 3, 10),
             'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 10.0, log=True),
             'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'n_jobs': -1,
-            'random_state': 42
+            'n_jobs': -1
         }
-        y_pred = xgboost_model.run(X_train, y_train, X_test, params)
-
-    # === 3. Ridge Regression Search Space ===
     elif model_name == 'Ridge':
         params = {
-            'alpha': trial.suggest_float('alpha', 0.1, 1000.0, log=True)
+            'alpha': trial.suggest_float('alpha', 0.1, 100.0, log=True)
         }
-        y_pred = ridge_model.run(X_train, y_train, X_test, params)
-
-    # === 4. MLP (ResNet) Search Space ===
     elif model_name == 'MLP':
         params = {
-            'hidden_dim': trial.suggest_categorical('hidden_dim', [64, 128, 256]),
-            'num_blocks': trial.suggest_int('num_blocks', 1, 4),
+            'hidden_dim': trial.suggest_categorical('hidden_dim', [64, 128]),
             'dropout_rate': trial.suggest_float('dropout_rate', 0.1, 0.5),
             'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
-            'batch_size': trial.suggest_categorical('batch_size', [64, 128, 256]),
-            'epochs': 20  # 固定 Epoch，靠早停或快速验证
+            'batch_size': trial.suggest_categorical('batch_size', [64, 128]),
+            'epochs': 10 
         }
-        y_pred = mlp_model.run(X_train, y_train, X_test, params)
-    
-    # === 5. LSTM Search Space ===
     elif model_name == 'LSTM':
         params = {
-            'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 128]),
-            'num_layers': trial.suggest_int('num_layers', 1, 2),
+            'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64]),
             'dropout': trial.suggest_float('dropout', 0.1, 0.4),
             'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
             'batch_size': 128,
-            'epochs': 15 
+            'epochs': 5 # LSTM 比较慢，调参时 Epoch 设小一点
         }
-        y_pred = lstm_model.run(X_train, y_train, X_test, params)
 
-    # 计算 MSE (这里不用 Sharpe 是因为 Sharpe 很难直接优化，MSE 稳健)
-    # 如果 y_pred 是 tensor 或 list，转为 numpy
-    if not isinstance(y_pred, np.ndarray):
-        y_pred = np.array(y_pred)
+    # === 2. 交叉验证 ===
+    # 3折交叉验证
+    tscv = TimeSeriesSplit(n_splits=3)
+    cv_scores = []
     
-    # 确保维度匹配
-    y_pred = y_pred.flatten()
-    
-    mse = mean_squared_error(y_test, y_pred)
-    return mse
+    for train_idx, val_idx in tscv.split(X):
+        X_train_cv, X_val_cv = X[train_idx], X[val_idx]
+        y_train_cv, y_val_cv = y[train_idx], y[val_idx]
+  
+        try:
+            # 调用模型的 run 函数
+            preds = model_module.run(X_train_cv, y_train_cv, X_val_cv, params)
+            mse = mean_squared_error(y_val_cv, preds)
+            cv_scores.append(mse)
+        except Exception as e:
+            # 如果某组参数导致模型崩溃（比如梯度爆炸），返回无穷大，让 Optuna 跳过
+            print(f"⚠️ Error in trial: {e}")
+            return float('inf')
+
+    return np.mean(cv_scores)
 
 def main():
     print("🚀 Loading Data for Auto-Tuning...")
-    # 只需要加载一次数据
-    X_train, X_test, y_train, y_test = load_and_process_data(DATA_PATH)
+    # 这里会使用 data_process 的缓存功能（如果上次跑过的话）
+    X, y = load_and_process_data(DATA_PATH)
     
-    # 定义要优化的模型
-    models_to_tune = ['Ridge', 'LGBM', 'XGBoost', 'MLP', 'LSTM']
+    # === 注册所有 5 个模型 ===
+    models_map = {
+        'Ridge': Ridge_Regression,
+        'LGBM': LGBM,
+        'XGBoost': XGboost,
+        'MLP': MLP,
+        'LSTM': LSTM  # <--- 之前这里漏了，加上它！
+    }
     
-    for model_name in models_to_tune:
-        print(f"\n===========================================")
+    for model_name, model_module in models_map.items():
+        print(f"\n{'='*40}")
         print(f"🤖 Tuning {model_name}...")
-        print(f"===========================================")
+        print(f"{'='*40}")
         
-        # 定义优化方向 (minimize MSE)
+        # 最小化 MSE
         study = optuna.create_study(direction='minimize')
         
-        # 针对不同模型设置不同的 Trial 次数
+        # 神经网络跑得慢，次数设少一点
         n_trials = N_TRIALS_NN if model_name in ['MLP', 'LSTM'] else N_TRIALS_TREE
         
-        # 开始优化
         try:
             study.optimize(
-                lambda trial: objective(trial, model_name, X_train, y_train, X_test, y_test), 
+                lambda trial: objective(trial, model_name, X, y, model_module), 
                 n_trials=n_trials
             )
             
             print(f"🏆 Best MSE for {model_name}: {study.best_value:.6f}")
             print(f"🔧 Best Params: {study.best_params}")
-            
-            # 自动保存到 configs/
             save_config(model_name, study.best_params)
             
         except Exception as e:
             print(f"❌ Error tuning {model_name}: {e}")
-            print("Skipping to next model...")
+            traceback.print_exc()
 
 if __name__ == "__main__":
     main()
