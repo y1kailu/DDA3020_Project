@@ -1,205 +1,228 @@
-import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-import os
-import tensorflow as keras
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
 
-# ================= Control Panel =================
-# Modify these parameters before running the script
+# ================= Configuration =================
+# 默认超参数 (如果 auto_tune 没有传入参数，则使用这些)
+DEFAULT_PARAMS = {
+    'hidden_dim': 64,
+    'num_layers': 2,
+    'dropout': 0.2,
+    'learning_rate': 0.001,
+    'batch_size': 64,
+    'epochs': 15,
+    'window_size': 10  # 时间窗口长度
+}
+
+# 选定的 Top 10 特征 (必须与 EDA 结果一致)
+SELECTED_FEATURES = ['M4', 'V13', 'S5', 'S2', 'V7', 'M2', 'M17', 'M12', 'M8', 'S6']
 # =================================================
 
-# 1. Feature Selection Switch
-# Set to True to use only Top 10 features, False to use all features
-USE_TOP_10_ONLY = False   
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, dropout):
+        super(LSTMModel, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        # 定义 LSTM 层
+        self.lstm = nn.LSTM(
+            input_dim, 
+            hidden_dim, 
+            num_layers, 
+            batch_first=True, 
+            dropout=dropout if num_layers > 1 else 0
+        )
+        
+        # 全连接层输出预测值
+        self.fc = nn.Linear(hidden_dim, 1)
+        
+    def forward(self, x):
+        # 初始化隐状态 (h0, c0)
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
+        
+        # 前向传播
+        out, _ = self.lstm(x, (h0, c0))
+        
+        # 取序列最后一个时间步的输出进行预测
+        out = self.fc(out[:, -1, :])
+        return out
 
-# 2. Model Hyperparameters
-WINDOW_SIZE = 5          # Lookback window size (e.g., 5 days)
-LSTM_UNITS = 64          # Number of neurons in LSTM layer
-DROPOUT_RATE = 0.4       # Dropout rate to prevent overfitting
-
-# 3. Training Configuration
-BATCH_SIZE = 32
-EPOCHS = 20
-# =================================================
-
-def create_sequences(data, target, window_size):
+def create_sequences(X, y, window_size):
     """
-    Helper function: Convert 2D dataframe into 3D array for LSTM (Samples, TimeSteps, Features)
+    将 2D 数据 (Rows, Features) 转换为 LSTM 需要的 3D 数据 (Samples, Window, Features)
     """
-    X, y = [], []
-    # Start from window_size index because we need prior history
-    for i in range(len(data) - window_size):
-        # Take the past 'window_size' days as features
-        X.append(data[i:(i + window_size)]) 
-        # Take the target of the current day to predict
-        y.append(target[i + window_size])
-    return np.array(X), np.array(y)
+    Xs, ys = [], []
+    # 确保输入是 numpy 数组
+    if isinstance(X, pd.DataFrame): X = X.values
+    if isinstance(y, pd.Series): y = y.values
+    
+    # 滑动窗口生成序列
+    for i in range(len(X) - window_size):
+        Xs.append(X[i:(i + window_size)])
+        if y is not None:
+            ys.append(y[i + window_size])
+            
+    return np.array(Xs), np.array(ys)
 
-def run_lstm():
+def run(X_train, y_train, X_test, params=None):
+    """
+    标准化接口函数：供 main.py 和 auto_tune.py 调用
+    """
     print("="*50)
-    print(">>> LSTM Start: Building Time-Series Neural Network...")
-    print("="*50)
-
-    # 1. Setup Paths
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    # Assuming data is in ../data/train.csv relative to models/ folder
-    data_path = os.path.join(current_dir, '..', 'data', 'train.csv')
-    file_path = os.path.normpath(data_path)
-
-    if not os.path.exists(file_path):
-        print(f"Error: File not found at {file_path}")
-        return
+    print(">>> LSTM (PyTorch): Training & Prediction...")
     
-    print(f"Loading data from: {file_path}")
-    df = pd.read_csv(file_path)
-    
-    # Sort by date to ensure time-series integrity
-    if 'date_id' in df.columns:
-        df = df.sort_values('date_id')
-        df = df.drop(columns=['date_id'])
-
-    # === Feature Selection Logic ===
-    target_col = 'forward_returns'
-    
-    if USE_TOP_10_ONLY:
-        print(f"★ Experiment Mode: ON. Using only Top 10 features.")
-        # Top 10 features identified in EDA
-        top_features = ['M4', 'V13', 'S5', 'S2', 'V7', 'M2', 'M17', 'M12', 'M8', 'S6']
-        # Ensure target is included
-        required_cols = top_features + [target_col]
-        # Filter dataframe (check if columns exist first)
-        existing_cols = [c for c in required_cols if c in df.columns]
-        df = df[existing_cols]
+    # 1. 参数初始化
+    if params is None:
+        params = DEFAULT_PARAMS
     else:
-        print(f"★ Experiment Mode: OFF. Using ALL features.")
-    # =====================================
+        # 如果传入部分参数，补全默认值
+        for k, v in DEFAULT_PARAMS.items():
+            if k not in params:
+                params[k] = v
     
-    # Drop target and leakage columns from features
-    drop_cols = [target_col, 'market_forward_excess_returns']
-    drop_cols = [c for c in drop_cols if c in df.columns]
-    
-    feature_df = df.drop(columns=drop_cols)
-    target_df = df[target_col]
+    # 自动检测设备 (GPU 优先)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"   Using device: {device}")
+    print(f"   Params: {params}")
 
-    print(f"Number of features: {feature_df.shape[1]}")
-    
-    # 3. Data Standardization
-    # LSTM is sensitive to scale, standardization is crucial
+    # 2. 特征对齐 (防止接口欺诈)
+    # 强制只使用 SELECTED_FEATURES，缺失的补 0
+    def align_features(df_input):
+        if not isinstance(df_input, pd.DataFrame):
+            return df_input # 如果已经是 numpy，假设特征已对齐
+        
+        df_aligned = pd.DataFrame(index=df_input.index)
+        for feat in SELECTED_FEATURES:
+            if feat in df_input.columns:
+                df_aligned[feat] = df_input[feat]
+            else:
+                df_aligned[feat] = 0.0
+        return df_aligned.fillna(0)
+
+    X_train_final = align_features(X_train)
+    X_test_final = align_features(X_test)
+
+    # 3. 数据标准化 (修复数据泄露)
+    # 仅在训练集上 fit，然后 transform 测试集
     scaler = StandardScaler()
-    feature_scaled = scaler.fit_transform(feature_df)
-    target_scaled = target_df.values # Target usually doesn't need scaling for regression, but can be done if needed
+    X_train_scaled = scaler.fit_transform(X_train_final)
+    X_test_scaled = scaler.transform(X_test_final)
+    
+    # 强制转换为 float32 (PyTorch 默认格式)
+    X_train_scaled = X_train_scaled.astype(np.float32)
+    X_test_scaled = X_test_scaled.astype(np.float32)
+    
+    if isinstance(y_train, pd.Series):
+        y_train = y_train.values.astype(np.float32)
+    else:
+        y_train = y_train.astype(np.float32)
 
-    # 4. Build Time-Series Sequences (Sliding Window)
-    print(f"Building time windows (Lookback: {WINDOW_SIZE} days)...")
-    X, y = create_sequences(feature_scaled, target_scaled, WINDOW_SIZE)
-    print(f"Data shape - Input X: {X.shape}, Target y: {y.shape}")
-    # X shape: (Samples, Window_Size, Features)
+    # 4. 构建时间序列 (3D Tensor)
+    window_size = int(params['window_size'])
+    
+    # 安全检查：数据长度必须大于窗口长度
+    if len(X_train_scaled) <= window_size:
+        print("⚠️ Error: Training data too short for window size.")
+        return np.zeros(len(X_test)) # 返回全0防止报错
+        
+    X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train, window_size)
+    
+    # 为测试集创建序列 (注意：这里会丢失前 window_size 个数据)
+    X_test_seq, _ = create_sequences(X_test_scaled, None, window_size)
+    
+    if len(X_test_seq) == 0:
+         print("⚠️ Warning: Test data too short. Returning zeros.")
+         return np.zeros(len(X_test))
 
-    # 5. Train/Validation Split (Sequential)
-    # No shuffling allowed for time-series!
-    split_idx = int(len(X) * 0.8) # 80% Train, 20% Val
-    
-    X_train, X_val = X[:split_idx], X[split_idx:]
-    y_train, y_val = y[:split_idx], y[split_idx:]
-    
-    print(f"Training Set: {len(X_train)}, Validation Set: {len(X_val)}")
-
-    # 6. Build LSTM Architecture
-    print("\n[Model] Constructing Neural Network...")
-    model = Sequential()
-    
-    # LSTM Layer
-    # return_sequences=False because we want one output after the sequence is processed
-    model.add(LSTM(units=LSTM_UNITS, input_shape=(X_train.shape[1], X_train.shape[2]), return_sequences=False))
-    
-    # Dropout Layer: Prevent overfitting
-    model.add(Dropout(DROPOUT_RATE))
-    
-    # Output Layer: Predicts one continuous value (return)
-    model.add(Dense(1))
-    
-    # Compile Model: MSE loss, Adam optimizer
-    model.compile(optimizer='adam', loss='mse')
-    
-    model.summary()
-
-    # 7. Train Model
-    print("\n[Training] Starting training loop...")
-    
-    # Early Stopping: Stop if validation loss doesn't improve for 3 epochs
-    early_stop = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
-    
-    history = model.fit(
-        X_train, y_train,
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        validation_data=(X_val, y_val),
-        callbacks=[early_stop],
-        verbose=1
+    # 转换为 Tensor 并加载到 DataLoader
+    train_dataset = TensorDataset(
+        torch.from_numpy(X_train_seq), 
+        torch.from_numpy(y_train_seq)
+    )
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=int(params['batch_size']), 
+        shuffle=False # 时间序列数据不打乱
     )
 
-    # 8. Prediction and Strategy Logic
-    print("\n[Prediction] Generating predictions...")
-    predictions = model.predict(X_val)
+    # 5. 初始化模型
+    input_dim = X_train_seq.shape[2]
+    model = LSTMModel(
+        input_dim=input_dim,
+        hidden_dim=int(params['hidden_dim']),
+        num_layers=int(params['num_layers']),
+        dropout=params['dropout']
+    ).to(device)
     
-    # Convert regression output to portfolio weights (0, 1, 2)
-    predicted_weights = []
-    for pred in predictions:
-        p = pred[0]
-        if p > 0.001:  # Strong signal threshold
-            weight = 1.0
-        elif p > 0.005: # Very strong signal
-            weight = 2.0
-        else:
-            weight = 0.0
-        predicted_weights.append(weight)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=params['learning_rate'])
+
+    # 6. 训练循环
+    model.train() # 开启 Dropout
+    for epoch in range(int(params['epochs'])):
+        train_loss = 0.0
+        for batch_X, batch_y in train_loader:
+            # 修复设备不匹配
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            # squeeze(-1) 确保维度匹配: (batch, 1) -> (batch)
+            loss = criterion(outputs.view(-1), batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
         
-    print("Prediction complete! Sample weights:", predicted_weights[:10])
-    
-    # Save Model
-    model.save('my_lstm_model.keras')
-    print("Model saved to 'my_lstm_model.keras'")
+        # 每 5 轮打印一次日志
+        if (epoch + 1) % 5 == 0:
+            print(f"   Epoch {epoch+1}/{params['epochs']}, Loss: {train_loss/len(train_loader):.6f}")
 
-    # ==========================================
-    # Evaluation Module
-    # ==========================================
+    # 7. 预测 (修复验证模式)
+    print("   Generating predictions...")
+    model.eval() # 关闭 Dropout
     
-    # --- 1. Calculate Directional Hit Rate ---
-    # True if directions match (both positive or both negative)
-    # Note: y_val is 1D array, predictions is 2D (N, 1)
-    true_direction = y_val > 0
-    pred_direction = predictions.flatten() > 0
-    hit_rate = np.mean(true_direction == pred_direction)
+    predictions_seq = []
+    test_tensor = torch.from_numpy(X_test_seq).to(device)
     
-    print("\n" + "="*30)
-    print(f"★ Evaluation Metrics ★")
-    print(f"Directional Hit Rate: {hit_rate * 100:.2f}%")
-    print("="*30 + "\n")
+    # 分批次预测以防止显存溢出 (虽然这里数据量不大，但更稳健)
+    # 简单起见，如果数据不大，直接全量预测
+    with torch.no_grad(): # 关闭梯度计算
+        preds = model(test_tensor)
+        predictions_seq = preds.cpu().numpy().flatten()
     
-    # --- 2. Visualization ---
-    plt.figure(figsize=(12, 6))
+    # 8. 结果对齐 (修复长度不一致)
+    # 因为滑动窗口吃掉了前 N 个数据，我们需要填充对齐，保证输出长度 == X_test 长度
+    pad_length = len(X_test) - len(predictions_seq)
     
-    # Plot first 100 days for clarity
-    plt.plot(y_val[:100], label='True Returns', color='gray', alpha=0.6)
-    plt.plot(predictions[:100], label='LSTM Predictions', color='red', linewidth=2)
-    
-    # Zero line
-    plt.axhline(y=0, color='black', linestyle='--', alpha=0.3)
-    
-    plt.title(f'LSTM Prediction Analysis (Hit Rate: {hit_rate*100:.1f}%)', fontsize=14)
-    plt.xlabel('Time Steps (Days)', fontsize=12)
-    plt.ylabel('Normalized Returns', fontsize=12)
-    plt.legend(fontsize=12)
-    plt.grid(True, alpha=0.3)
-    
-    # Save plot
-    plt.savefig('lstm_report_plot.png', dpi=300)
-    print("-> Plot saved as: lstm_report_plot.png")
-    plt.show()
+    if pad_length > 0:
+        # 策略：用第一个预测值填充前面的空缺 (Backfill)
+        # 或者用 0 填充。这里选择用第一个有效值填充，保持趋势连续性。
+        first_val = predictions_seq[0] if len(predictions_seq) > 0 else 0.0
+        padding = np.full(pad_length, first_val)
+        final_predictions = np.concatenate([padding, predictions_seq])
+    else:
+        final_predictions = predictions_seq
 
+    print(f"   >>> LSTM Done. Output shape: {final_predictions.shape}")
+    
+    # 9. 修复沉默输出
+    return final_predictions
+
+# 单元测试 (独立运行时执行)
 if __name__ == "__main__":
-    run_lstm()
+    print("Running LSTM standalone test...")
+    # 生成假数据测试流程
+    dummy_X = pd.DataFrame(np.random.randn(100, 15), columns=[f'col_{i}' for i in range(15)])
+    dummy_X['M4'] = dummy_X['col_0'] # 模拟真实特征名
+    dummy_y = pd.Series(np.random.randn(100))
+    
+    dummy_X_test = pd.DataFrame(np.random.randn(30, 15), columns=[f'col_{i}' for i in range(15)])
+    dummy_X_test['M4'] = dummy_X_test['col_0']
+
+    preds = run(dummy_X, dummy_y, dummy_X_test)
+    print(f"Test passed if shape is (30,): {preds.shape}")
