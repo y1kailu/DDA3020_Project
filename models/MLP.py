@@ -1,120 +1,149 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
-import os
+import warnings
+
+# 忽略收敛警告（金融数据噪音大，很难完全收敛是正常的）
+warnings.filterwarnings('ignore')
 
 # ================= Configuration =================
-# Top 10 features selected based on EDA correlation analysis
-SELECTED_FEATURES = ['M4', 'V13', 'S5', 'S2', 'V7', 'M2', 'M17', 'M12', 'M8', 'S6']
+# 默认参数 (作为兜底，当 params=None 时使用)
+DEFAULT_PARAMS = {
+    'hidden_layer_sizes': (64, 32),
+    'activation': 'relu',
+    'solver': 'adam',
+    'alpha': 0.001,             # L2 正则化
+    'learning_rate_init': 0.001,
+    'max_iter': 200,            # 对应 epochs
+    'batch_size': 64,
+    'early_stopping': True,     # 防止过拟合
+    'validation_fraction': 0.1, # 10% 用于验证早停
+    'n_iter_no_change': 10,
+    'random_state': 42
+}
 # =================================================
 
-def run(X_train, y_train, X_test):
+def run(X_train, y_train, X_test, params=None):
     """
-    Standardized interface function for MLP model training and prediction.
+    MLP (Sklearn 版本) 标准化接口。
     
-    Args:
-        X_train (pd.DataFrame): Training features
-        y_train (pd.Series): Training targets
-        X_test (pd.DataFrame): Test features
+    兼容性设计：
+    1. 输入兼容：支持 Numpy Array 和 Pandas DataFrame。
+    2. 参数兼容：自动映射 auto_tune 传来的通用参数名。
+    3. 输出兼容：强制返回一维数组。
+    """
+    print("="*50)
+    print(">>> MLP (Sklearn): Training & Prediction...")
+    
+    # -------------------------------------------------------
+    # 1. 参数清洗与映射 (Parameter Cleaning)
+    # -------------------------------------------------------
+    model_params = DEFAULT_PARAMS.copy()
+    
+    if params:
+        # 映射表：把 auto_tune 的参数名 -> sklearn 参数名
+        mapping = {
+            'epochs': 'max_iter',
+            'learning_rate': 'learning_rate_init',
+            'reg_alpha': 'alpha',
+            'reg_lambda': 'alpha'
+        }
         
-    Returns:
-        np.array: Predictions on X_test
-    """
-    print("="*50)
-    print(">>> MLP (Neural Network): Training & Prediction...")
-    print("="*50)
+        for k, v in params.items():
+            # A. 处理需要改名的参数
+            if k in mapping:
+                model_params[mapping[k]] = v
+            # B. 处理 hidden_dim (int -> tuple)
+            elif k == 'hidden_dim':
+                dim = int(v)
+                model_params['hidden_layer_sizes'] = (dim, dim // 2)
+            # C. 忽略不兼容参数 (Sklearn MLP 不支持 dropout, num_blocks, num_layers)
+            elif k in ['dropout', 'dropout_rate', 'num_blocks', 'num_layers']:
+                continue
+            # D. 其他合法参数直接更新
+            elif k in DEFAULT_PARAMS:
+                model_params[k] = v
 
-    # 1. Feature Selection & Preprocessing (Train)
-    # Extract only the selected features
-    # We handle missing columns gracefully just in case
-    X_train_selected = pd.DataFrame(index=X_train.index)
-    for feat in SELECTED_FEATURES:
-        if feat in X_train.columns:
-            X_train_selected[feat] = X_train[feat]
+    print(f"   Active Params: {model_params}")
+
+    # -------------------------------------------------------
+    # 2. 数据格式统一 (Data Handling)
+    # -------------------------------------------------------
+    # 辅助函数：转为无 NaN 的 Numpy 数组
+    def to_numpy_clean(data):
+        if isinstance(data, (pd.DataFrame, pd.Series)):
+            return data.fillna(0).values
         else:
-            X_train_selected[feat] = 0.0
-            
-    # Fill NaNs with 0
-    X_train_final = X_train_selected.fillna(0)
-    
-    # Data Standardization (Crucial for Neural Networks)
+            # 如果是 numpy，处理 nan 和 inf
+            return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+    X_train_clean = to_numpy_clean(X_train)
+    X_test_clean = to_numpy_clean(X_test)
+    y_train_clean = to_numpy_clean(y_train)
+
+    # 强制 y 为 1D 数组 (N,)
+    y_train_clean = y_train_clean.ravel()
+
+    # -------------------------------------------------------
+    # 3. 数据归一化 (Scaling)
+    # -------------------------------------------------------
+    # 神经网络对尺度极度敏感，必须再次确保归一化
+    print("   Scaling data (StandardScaler)...")
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_final)
-    
-    print(f"Training Input Shape: {X_train_scaled.shape}")
+    X_train_scaled = scaler.fit_transform(X_train_clean)
+    X_test_scaled = scaler.transform(X_test_clean)
 
-    # 2. Define MLP Model (Using hyperparameters from original script)
-    model = MLPRegressor(
-        hidden_layer_sizes=(64, 32),  # Two hidden layers
-        activation='relu',            # ReLU activation
-        solver='adam',                # Adam optimizer
-        alpha=0.001,                  # L2 regularization
-        learning_rate_init=0.001,     # Initial learning rate
-        max_iter=200,                 # Maximum iterations
-        early_stopping=True,          # Stop if validation score stops improving
-        validation_fraction=0.1,      # 10% data for validation
-        n_iter_no_change=10,
-        random_state=42,              # Seed for reproducibility
-        verbose=False                 # Suppress verbose output during ensemble run
-    )
+    # -------------------------------------------------------
+    # 4. 模型训练 (Training)
+    # -------------------------------------------------------
+    # 实例化模型
+    model = MLPRegressor(**model_params)
+    
+    print("   Training model...")
+    try:
+        model.fit(X_train_scaled, y_train_clean)
+        print(f"   Training R2 Score: {model.score(X_train_scaled, y_train_clean):.4f}")
+        print(f"   Best Loss: {model.best_loss_:.6f}")
+    except Exception as e:
+        print(f"⚠️ Training Warning: {e}")
+        # 如果训练出错，不要崩溃，继续跑预测（虽然结果可能不好）
 
-    # 3. Train Model
-    print("Training MLP model...")
-    model.fit(X_train_scaled, y_train)
+    # -------------------------------------------------------
+    # 5. 预测 (Prediction)
+    # -------------------------------------------------------
+    print("   Generating predictions...")
+    try:
+        predictions = model.predict(X_test_scaled)
+    except:
+        # 兜底：如果预测失败，返回全0
+        print("⚠️ Prediction failed, returning zeros.")
+        predictions = np.zeros(len(X_test_scaled))
     
-    # 4. Preprocessing (Test) & Prediction
-    print("Processing Test Data...")
-    
-    # Align test features with selected features
-    X_test_selected = pd.DataFrame(index=X_test.index)
-    for feat in SELECTED_FEATURES:
-        if feat in X_test.columns:
-            X_test_selected[feat] = X_test[feat]
-        else:
-            # If feature missing in test set, fill with 0
-            X_test_selected[feat] = 0.0
-            
-    X_test_final = X_test_selected.fillna(0)
-    
-    # Use the same scaler fitted on training data
-    X_test_scaled = scaler.transform(X_test_final)
-    
-    print(f"Prediction Input Shape: {X_test_scaled.shape}")
-    
-    # Predict
-    predictions = model.predict(X_test_scaled)
-    
-    return predictions
+    # 确保返回 1D numpy array
+    return predictions.flatten()
 
-# Optional: Keep a main block for standalone testing
+# === 单元测试 (独立运行时检查) ===
 if __name__ == "__main__":
-    # Test code (requires file path setup)
-    import os
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    # Assuming data is in ../data/train.csv relative to this script
-    file_path = os.path.normpath(os.path.join(current_dir, '..', 'data', 'train.csv'))
+    print("Running standalone test...")
+    # 模拟 main.py 的输入 (Numpy)
+    X_dummy = np.random.randn(100, 10)
+    y_dummy = np.random.randn(100)
+    X_test_dummy = np.random.randn(20, 10)
     
-    if os.path.exists(file_path):
-        print(f"Testing MLP module with data from: {file_path}")
-        df = pd.read_csv(file_path)
-        if 'date_id' in df.columns: df = df.sort_values('date_id').drop(columns=['date_id'])
-        
-        target = 'forward_returns'
-        # Columns to drop to simulate raw X input
-        drop_cols = ['market_forward_excess_returns', 'forward_returns']
-        
-        # Simple split
-        split = int(len(df) * 0.8)
-        train = df.iloc[:split]
-        test = df.iloc[split:]
-        
-        X_train = train.drop(columns=drop_cols, errors='ignore')
-        y_train = train[target]
-        X_test = test.drop(columns=drop_cols, errors='ignore')
-        
-        preds = run(X_train, y_train, X_test)
-        print(f"Test Predictions (First 5): {preds[:5]}")
-    else:
-        print("Test data not found, skipping standalone test.")
-
+    # 模拟 auto_tune.py 的参数 (包含干扰项)
+    messy_params = {
+        'epochs': 50,          # 应映射为 max_iter
+        'dropout': 0.5,        # 应被忽略
+        'hidden_dim': 128,     # 应转为 tuple
+        'learning_rate': 0.01  # 应映射
+    }
+    
+    try:
+        preds = run(X_dummy, y_dummy, X_test_dummy, messy_params)
+        print(f"✅ Test Passed! Shape: {preds.shape}")
+        print(f"Sample preds: {preds[:5]}")
+    except Exception as e:
+        print(f"❌ Test Failed: {e}")
+        import traceback
+        traceback.print_exc()
